@@ -1,0 +1,27 @@
+[project]
+name = "qwen-video-to-html-game"
+version = "0.1.0"
+description = "Turn short gameplay videos into playable single-file HTML5 games with Ollama and Qwen."
+authors = [
+    { name = "guiyilin-looki" }
+]
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "streamlit>=1.58.0",
+    "opencv-python>=4.13.0.92",
+    "ollama>=0.6.2",
+    "pydantic>=2.13.0",
+]
+
+[tool.poetry]
+package-mode = false
+
+[tool.poetry.group.dev.dependencies]
+ruff = ">=0.15.0"
+watchdog = "^6.0.0"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
