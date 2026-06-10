@@ -1,8 +1,8 @@
 # Qwen Video to HTML Game
 
-A local Streamlit prototype that turns a short gameplay video into a playable single-file HTML5 Canvas game with Ollama and Qwen.
+A local, observable video-to-game workbench powered by FastAPI, Ollama, and Qwen.
 
-The project follows the workflow from the reference article in `ref_link.txt`: extract a few representative frames from an uploaded video, ask a local multimodal Qwen model to infer a structured game specification, then ask the model to generate a minimal browser game from that specification.
+The app turns a short gameplay video into a playable single-file HTML5 Canvas game, but it no longer hides the process behind one long spinner. The workflow is split into explicit stages: upload video, inspect extracted frames, review the model input, generate and edit `game_spec.json`, then generate the final HTML game.
 
 Reference article:
 https://www.datacamp.com/fr/tutorial/qwen-3-5-small-models-tutorial
@@ -10,33 +10,57 @@ https://www.datacamp.com/fr/tutorial/qwen-3-5-small-models-tutorial
 ## Features
 
 - Upload gameplay videos in `mp4`, `mov`, `avi`, `mkv`, or `webm` format.
-- Extract 3 to 8 video frames with OpenCV.
-- Use a local Ollama model, defaulting to `qwen3.5:9b`.
-- Infer a structured `GameSpec` JSON with entities, controls, physics, scoring, and win/lose conditions.
-- Generate a complete standalone HTML5 Canvas game.
-- Preview the game directly inside Streamlit.
-- Download both the generated HTML game and the inferred JSON spec.
-- Patch generated HTML so keyboard controls work inside Streamlit iframe previews.
+- Treat each uploaded video as a persistent Project.
+- Automatically load existing Projects when the app opens.
+- Extract and inspect representative frames before any LLM call.
+- Show the exact system prompt, user prompt, model options, and frame count sent to Ollama.
+- Stream LLM output while generating `game_spec.json`.
+- Edit the generated GameSpec manually in a JSON editor.
+- Ask the model to modify the GameSpec through a chat-style instruction.
+- Show the final GameSpec used to prompt the gameplay module generator.
+- Generate a gameplay JavaScript module with Ollama, then embed it in a stable single-file Canvas HTML runtime.
+- Preview and download the generated single-file HTML5 game.
+
+## Stack
+
+- Backend: FastAPI + Uvicorn
+- Frontend: vanilla HTML, CSS, and JavaScript
+- Video processing: OpenCV
+- LLM runtime: Ollama
+- Schema validation: Pydantic
+- Environment management: pyenv + Poetry
 
 ## Project Files
 
 ```text
 .
-├── .python-version # pyenv Python version pin
-├── app.py           # Streamlit application and generation pipeline
-├── pyproject.toml   # Poetry project metadata and dependencies
-├── poetry.lock      # Locked dependency graph
-├── requirements.txt # Python dependencies
-├── ref_link.txt     # Source article URL
-└── 技术文章.md       # Chinese technical article
+├── .python-version
+├── app.py
+├── static/
+│   ├── index.html
+│   ├── styles.css
+│   └── app.js
+├── pyproject.toml
+├── poetry.lock
+├── requirements.txt
+└── ref_link.txt
 ```
 
-Generated files are saved to:
+Projects are saved under:
 
 ```text
-outputs_local/
-├── game_spec.json
-└── generated_game.html
+outputs_local/projects/
+```
+
+Each Project may contain:
+
+```text
+source.mov
+frames/
+specs/
+html/
+logs/
+project.json
 ```
 
 ## Requirements
@@ -45,7 +69,7 @@ outputs_local/
 - Poetry
 - Python 3.12.13, pinned by `.python-version`
 - Ollama installed locally
-- A Qwen 3.5 model available in Ollama, for example `qwen3.5:9b`
+- A Qwen model available in Ollama, for example `qwen3.5:9b`
 
 Pull or start the model first:
 
@@ -53,18 +77,11 @@ Pull or start the model first:
 ollama run qwen3.5:9b
 ```
 
-## Installation With pyenv + Poetry
-
-Install the pinned Python version:
+## Installation
 
 ```bash
 pyenv install -s 3.12.13
 pyenv local 3.12.13
-```
-
-Create the project-local Poetry virtual environment and install dependencies:
-
-```bash
 poetry config virtualenvs.in-project true --local
 poetry env use "$(pyenv which python)"
 poetry install
@@ -73,57 +90,32 @@ poetry install
 ## Run
 
 ```bash
-poetry run streamlit run app.py
+poetry run uvicorn app:app --host 127.0.0.1 --port 8501 --reload
 ```
 
-Then open the Streamlit URL shown in the terminal, usually:
+Open:
 
 ```text
-http://localhost:8501
+http://127.0.0.1:8501
 ```
 
-## How It Works
+## Workflow
 
-The pipeline has two model calls:
+1. Open the app and select an existing Project, or upload a short gameplay video to create a new Project.
+2. Extract frames and inspect whether they capture the important gameplay states.
+3. Review the GameSpec model input: system prompt, user prompt, options, and attached frame count.
+4. Generate `game_spec.json` with streaming output.
+5. Edit the GameSpec manually or ask the model to revise it through the chat control.
+6. Review the GameSpec that will drive the gameplay module prompt.
+7. Generate the final HTML game: Ollama writes only `createGameModule(api)`, and the backend validates it inside a fixed Canvas runtime.
+8. Preview the game in the browser and download the standalone HTML file.
 
-1. Video understanding
-
-   `app.py` samples frames from the uploaded video and sends them to the local Qwen model. The model returns strict JSON describing a small playable game.
-
-2. Code generation
-
-   The validated JSON spec is converted into a code-generation prompt. The model returns a complete HTML document with inline CSS and JavaScript.
-
-This two-step design makes the result easier to debug. If the final game is wrong, you can inspect `game_spec.json` to see whether the issue came from visual understanding or from code generation.
+The app persists every Project on disk. Reopening the app restores the Project list, current video, extracted frames, current GameSpec, current HTML preview, and artifact history.
 
 ## Notes
 
-- Short clips with clear 2D gameplay work best.
-- Simple arcade games such as Pong, Breakout, dodgers, runners, and Flappy Bird style games are more reliable than complex 3D or UI-heavy games.
-- The generated game is a simplified playable approximation, not a high-fidelity clone.
-- If the preview does not respond to keyboard input, click once inside the game canvas.
-
-## Troubleshooting
-
-If Streamlit cannot import OpenCV or Streamlit:
-
-```bash
-poetry install
-```
-
-If model generation fails, confirm Ollama is running and the configured model exists:
-
-```bash
-ollama list
-ollama run qwen3.5:9b
-```
-
-If JSON validation fails, try reducing ambiguity:
-
-- Upload a shorter gameplay clip.
-- Increase the extracted frame count.
-- Add a stronger gameplay hint in the sidebar.
-
-## Optional requirements.txt
-
-`requirements.txt` is kept for simple pip-based environments, but the recommended project setup is Poetry because `poetry.lock` gives reproducible dependency versions.
+- The app shows model inputs and visible model outputs. It does not expose hidden chain-of-thought.
+- No database is used. `outputs_local/projects/` is the source of truth.
+- Short, clear 2D gameplay videos work best.
+- Simple arcade games such as Snake, Pong, Breakout, runners, and dodgers are more reliable than complex 3D games.
+- `requirements.txt` is kept for simple pip-based environments, but Poetry is the recommended setup.

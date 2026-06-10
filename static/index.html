@@ -1,0 +1,281 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Qwen Video to HTML Game</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark">Q</div>
+          <div>
+            <h1>Video to Game</h1>
+          </div>
+        </div>
+
+        <nav class="steps" aria-label="Workflow">
+          <button class="step active" data-step="upload">
+            <span>1</span>
+            <strong>上传视频</strong>
+          </button>
+          <button class="step" data-step="frames" disabled>
+            <span>2</span>
+            <strong>抽帧检查</strong>
+          </button>
+          <button class="step" data-step="spec" disabled>
+            <span>3</span>
+            <strong>GameSpec</strong>
+          </button>
+          <button class="step" data-step="html" disabled>
+            <span>4</span>
+            <strong>生成游戏</strong>
+          </button>
+        </nav>
+
+        <section class="settings">
+          <div class="project-list-block">
+            <div class="project-list-header">
+              <span>Projects</span>
+              <button id="refreshProjectsBtn" type="button">刷新</button>
+            </div>
+            <div id="projectList" class="project-list">
+              <p class="empty-text">正在加载...</p>
+            </div>
+          </div>
+
+          <label>
+            <span>Ollama 模型</span>
+            <input id="modelInput" value="qwen3.5:9b" autocomplete="off" />
+          </label>
+          <label>
+            <span>抽帧数量</span>
+            <input id="frameCountInput" type="number" min="3" max="12" value="5" />
+          </label>
+          <label>
+            <span>额外约束</span>
+            <textarea id="constraintsInput" rows="5">Keep the game simple, responsive, and playable with arrow keys or spacebar.</textarea>
+          </label>
+        </section>
+      </aside>
+
+      <main class="workspace">
+        <header class="topbar">
+          <div>
+            <h2 id="viewTitle">上传视频</h2>
+            <p id="viewDescription">先上传一段短游戏视频。后续每一步都能看到输入、输出和中间状态。</p>
+          </div>
+          <div class="status-pill" id="statusPill">等待上传</div>
+        </header>
+
+        <section class="view active" id="uploadView">
+          <div class="panel upload-panel">
+            <div class="dropzone" id="dropzone">
+              <input id="videoInput" type="file" accept="video/mp4,video/quicktime,video/x-matroska,video/webm,video/x-msvideo" />
+              <div class="drop-icon">↑</div>
+              <h3>选择或拖入游戏视频</h3>
+              <p>建议使用短视频，并提前用 ffmpeg 缩小到 480p 或 640p。</p>
+            </div>
+            <video id="videoPreview" controls hidden></video>
+          </div>
+
+          <div class="panel">
+            <div class="panel-header">
+              <div>
+                <h3>当前 Project</h3>
+                <p id="projectSummaryText">上传新视频或从左侧选择已有项目。</p>
+              </div>
+            </div>
+            <dl class="metadata" id="videoMetadata">
+              <div><dt>状态</dt><dd>尚未上传</dd></div>
+            </dl>
+          </div>
+        </section>
+
+        <section class="view" id="framesView">
+          <div class="panel">
+            <div class="panel-header">
+              <div>
+                <h3>抽帧结果</h3>
+                <p>这些图片会作为视觉输入发送给 Ollama。</p>
+              </div>
+              <button class="primary" id="extractFramesBtn">抽取关键帧</button>
+            </div>
+            <div class="frame-grid" id="frameGrid"></div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-header">
+              <div>
+                <h3>步骤 1 · 玩法提示输入</h3>
+                <p>确认抽帧后，可查看将发送给模型的玩法提示 prompt（含图片）。</p>
+              </div>
+              <button id="loadHintInputBtn" disabled>查看输入</button>
+            </div>
+            <div class="two-col">
+              <div>
+                <h4>System Prompt</h4>
+                <pre id="hintSystemPrompt" class="code small"></pre>
+              </div>
+              <div>
+                <h4>User Prompt</h4>
+                <pre id="hintUserPrompt" class="code small"></pre>
+              </div>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-header">
+              <div>
+                <h3>步骤 2 · GameSpec 输入</h3>
+                <p>基于玩法提示生成精简 JSON，不再发送图片。</p>
+              </div>
+              <button id="loadSpecInputBtn" disabled>查看输入</button>
+            </div>
+            <div class="two-col">
+              <div>
+                <h4>System Prompt</h4>
+                <pre id="specSystemPrompt" class="code small"></pre>
+              </div>
+              <div>
+                <h4>User Prompt</h4>
+                <pre id="specUserPrompt" class="code small"></pre>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="view" id="specView">
+          <div class="split">
+            <div class="spec-steps">
+              <div class="panel">
+              <div class="panel-header">
+                <div>
+                  <h3>步骤 1 · 玩法提示</h3>
+                  <p>先从抽帧生成中文玩法描述（JSON 提取），可编辑后再生成 GameSpec。</p>
+                </div>
+                <button class="primary" id="generateHintBtn" disabled>从抽帧生成玩法提示</button>
+              </div>
+              <label class="field-block">
+                <span>玩法提示</span>
+                <textarea
+                  id="gameHintInput"
+                  rows="4"
+                  spellcheck="false"
+                  placeholder="点击上方按钮从抽帧生成，或直接手动填写"
+                  disabled
+                ></textarea>
+                <small class="field-hint">步骤 1 从抽帧生成中文玩法描述；确认后可编辑，再生成 JSON。</small>
+              </label>
+              <pre id="hintStreamOutput" class="code stream compact"></pre>
+            </div>
+
+            <div class="panel">
+              <div class="panel-header">
+                <div>
+                  <h3>步骤 2 · GameSpec JSON</h3>
+                  <p>模型只生成精简 draft JSON，服务端展开为完整 GameSpec；失败时用结构化规格 fallback。</p>
+                </div>
+                <button class="primary" id="generateSpecBtn" disabled>生成 game_spec.json</button>
+              </div>
+              <pre id="specStreamOutput" class="code stream"></pre>
+              </div>
+            </div>
+
+            <div class="panel">
+              <div class="panel-header">
+                <div>
+                  <h3>可编辑 GameSpec</h3>
+                  <p>可以手动改 JSON，也可以用下方对话让模型改。</p>
+                </div>
+                <button id="validateSpecBtn" disabled>校验 JSON</button>
+              </div>
+              <textarea id="specEditor" class="json-editor" spellcheck="false"></textarea>
+              <div class="inline-actions">
+                <input id="chatInput" placeholder="例如：把蛇的速度调慢一点，增加网格背景" disabled />
+                <button id="chatEditBtn" disabled>让模型修改</button>
+              </div>
+              <pre id="chatStreamOutput" class="code stream compact"></pre>
+            </div>
+          </div>
+        </section>
+
+        <section class="view" id="htmlView">
+          <div class="panel">
+            <div class="panel-header">
+              <div>
+                <h3>HTML 生成输入</h3>
+                  <p>这里展示最终用于完整 HTML 生成的 prompt。</p>
+              </div>
+              <button id="loadHtmlInputBtn" disabled>查看输入</button>
+            </div>
+            <div class="two-col">
+              <div>
+                <h4>System Prompt</h4>
+                <pre id="htmlSystemPrompt" class="code small"></pre>
+              </div>
+              <div>
+                <h4>User Prompt</h4>
+                <pre id="htmlUserPrompt" class="code small"></pre>
+              </div>
+            </div>
+          </div>
+
+          <div class="split">
+            <div class="panel">
+              <div class="panel-header">
+                <div>
+                  <h3>生成单文件 HTML</h3>
+                  <p>生成一个完整单文件 HTML；后端用 Playwright 校验，通过后保存。</p>
+                </div>
+                <div class="inline-actions">
+                  <button class="primary" id="generateHtmlBtn" disabled>生成 HTML 游戏</button>
+                  <button id="cancelHtmlBtn" type="button" hidden>终止生成</button>
+                </div>
+              </div>
+              <label class="field-block">
+                <span>HTML 生成服务</span>
+                <select id="htmlProviderInput">
+                  <option value="deepseek" selected>DeepSeek</option>
+                  <option value="ollama">Ollama</option>
+                </select>
+                <small class="field-hint">只影响最后一步 HTML 生成/修复；视觉抽帧和 GameSpec 仍使用左侧 Ollama 模型。</small>
+              </label>
+              <label class="field-block">
+                <span>HTML 生成模型</span>
+                <input id="htmlModelInput" value="deepseek-v4-pro" autocomplete="off" />
+                <small class="field-hint">DeepSeek 推荐 deepseek-v4-pro；Ollama 可填 gemma4:e4b 或本地模型名。</small>
+              </label>
+              <pre id="htmlStreamOutput" class="code stream"></pre>
+              <div class="inline-actions">
+                <input
+                  id="htmlChatInput"
+                  placeholder="例如：按空格无法开始；蛇撞墙后无法重启；分数不更新"
+                  disabled
+                />
+                <button id="htmlChatEditBtn" disabled>让模型修复</button>
+                <button id="cancelHtmlChatBtn" type="button" hidden>终止修复</button>
+              </div>
+              <pre id="htmlChatStreamOutput" class="code stream compact"></pre>
+              <div class="inline-actions">
+                <a id="downloadLink" class="button-link disabled" href="#" download>下载 HTML</a>
+              </div>
+            </div>
+
+            <div class="panel preview-panel">
+              <div class="panel-header">
+                <h3>游戏预览</h3>
+              </div>
+              <iframe id="gamePreview" title="Generated game preview"></iframe>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <div class="toast" id="toast" hidden></div>
+    <script src="/static/app.js"></script>
+  </body>
+</html>

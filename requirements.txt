@@ -1,4 +1,10 @@
-streamlit
+fastapi
+uvicorn
+python-multipart
 opencv-python
 ollama
 pydantic
+socksio
+playwright
+openai
+python-dotenv

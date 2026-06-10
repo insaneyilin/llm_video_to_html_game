@@ -1,516 +1,588 @@
-import base64
+"""
+Qwen Video to HTML Game — FastAPI application.
+
+Pipeline: upload video -> extract frames -> gameplay hint -> GameSpec -> HTML game.
+"""
+
 import json
-import tempfile
+import shutil
+import threading
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, List
+from typing import Any, Iterable
 
-import cv2
-import ollama
-import streamlit as st
-import streamlit.components.v1 as components
-from pydantic import BaseModel, Field, ValidationError, field_validator
+from dotenv import load_dotenv
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 
-OUTPUT_DIR = Path("outputs_local")
-OUTPUT_DIR.mkdir(exist_ok=True)
-
-DEFAULT_MODEL = "qwen3:8b"
-STREAM_PREVIEW_LIMIT = 24_000
-STREAM_UPDATE_CHARS = 160
-
-
-def ensure_string_list(value: Any) -> List[str]:
-    if value is None:
-        return []
-    if isinstance(value, str):
-        return [value]
-    if isinstance(value, list):
-        return [str(item) for item in value if item is not None]
-    return [str(value)]
-
-
-class Entity(BaseModel):
-    name: str
-    role: str
-    behavior: str
-
-
-class Physics(BaseModel):
-    gravity: str = ""
-    jump_or_impulse: str = ""
-    collision_style: str = ""
-    movement_style: str = ""
-
-
-class VisualStyle(BaseModel):
-    perspective: str = ""
-    palette: str = ""
-    background: str = ""
-    ui_elements: List[str] = Field(default_factory=list)
-
-    @field_validator("ui_elements", mode="before")
-    @classmethod
-    def normalize_ui_elements(cls, value: Any) -> List[str]:
-        return ensure_string_list(value)
+from llm import ollama_chat_complete, stream_chat_with_heartbeat
+from models import (
+    ExtractRequest,
+    GameSpec,
+    HintRequest,
+    HtmlEditRequest,
+    HtmlRequest,
+    SpecEditRequest,
+    SpecRequest,
+    ensure_string_list,
+)
+from pipeline import (
+    extract_frames,
+    extract_json_object,
+    expand_spec_draft,
+    game_spec_to_draft,
+    generic_spec_from_hint,
+    load_frame_images,
+    parse_gameplay_hint,
+    parse_spec_draft,
+    prepare_full_html_output,
+    strip_server_html_patch,
+    validate_html_game_output,
+    validate_html_with_playwright,
+    video_metadata,
+)
+from prompts import (
+    FULL_HTML_SYSTEM_PROMPT,
+    HINT_SYSTEM_PROMPT,
+    HTML_EDIT_SYSTEM_PROMPT,
+    SPEC_DRAFT_SYSTEM_PROMPT,
+    SPEC_EDIT_SYSTEM_PROMPT,
+    build_full_html_prompt,
+    build_hint_prompt,
+    build_html_edit_prompt,
+    build_spec_edit_prompt,
+    build_spec_prompt,
+)
 
 
-class GameSpec(BaseModel):
-    title: str
-    genre: str
-    objective: str
-    player_controls: List[str]
-    gameplay_loop: List[str]
-    entities: List[Entity]
-    scoring_rules: List[str]
-    win_condition: str
-    lose_condition: str
-    physics: Physics
-    visual_style: VisualStyle
-    assumptions: List[str]
-    confidence_notes: List[str]
+BASE_DIR = Path(__file__).parent
+load_dotenv(BASE_DIR / ".env")
+STATIC_DIR = BASE_DIR / "static"
+PROJECTS_DIR = BASE_DIR / "outputs_local" / "projects"
+PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
 
-    @field_validator(
-        "player_controls",
-        "gameplay_loop",
-        "scoring_rules",
-        "assumptions",
-        "confidence_notes",
-        mode="before",
+SPEC_NUM_CTX = 8192
+HTML_NUM_CTX = 32768
+HTML_NUM_PREDICT = 32768
+
+app = FastAPI(title="Qwen Video to HTML Game")
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
+# --- Helpers ---
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+def safe_id(value: str) -> str:
+    if "/" in value or ".." in value:
+        raise HTTPException(status_code=400, detail="Invalid project id.")
+    return value
+
+
+def project_path(project_id: str) -> Path:
+    path = PROJECTS_DIR / safe_id(project_id)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Project not found.")
+    return path
+
+
+def read_project(project_id: str) -> dict[str, Any]:
+    manifest = project_path(project_id) / "project.json"
+    if not manifest.exists():
+        raise HTTPException(status_code=404, detail="Project manifest not found.")
+    return json.loads(manifest.read_text(encoding="utf-8"))
+
+
+def write_project(project_id: str, project: dict[str, Any]) -> None:
+    project["updated_at"] = now_iso()
+    (project_path(project_id) / "project.json").write_text(
+        json.dumps(project, indent=2, ensure_ascii=False), encoding="utf-8"
     )
-    @classmethod
-    def normalize_string_lists(cls, value: Any) -> List[str]:
-        return ensure_string_list(value)
 
 
-SPEC_SYSTEM_PROMPT = """
-You are a gameplay reverse-engineering analyst and minimalist arcade game designer.
-You receive a handful of video frames and infer the smallest playable HTML5 game clone.
-Only infer mechanics that are visible or strongly implied.
-Prefer simple arcade mechanics such as Pong, Breakout, Snake, Flappy Bird, runner, or dodger games when evidence is incomplete.
-Return strict JSON only. No markdown. No code fences.
-""".strip()
+def project_for_client(project: dict[str, Any]) -> dict[str, Any]:
+    out = json.loads(json.dumps(project, ensure_ascii=False))
+    out.pop("video_path", None)
+    for frame in out.get("frames", []):
+        frame.pop("image_base64", None)
+    return out
 
 
-CODE_SYSTEM_PROMPT = """
-You are a senior JavaScript canvas game developer.
-Generate a complete self-contained single-file HTML game.
-Rules:
-- Return raw HTML only.
-- Use inline CSS and JavaScript.
-- Use HTML5 canvas for gameplay.
-- Use no external libraries, assets, CDNs, network calls, audio, or images.
-- Include score, visible controls, start/restart support, and a clear game-over state.
-- Use requestAnimationFrame.
-- Make keyboard controls work in an iframe.
-- The canvas must have tabindex="0".
-- Automatically focus the canvas on load, click, start, and restart.
-- Prevent default behavior for arrow keys and spacebar.
-""".strip()
+def ndjson_event(event: str, data: Any) -> str:
+    return json.dumps({"event": event, "data": data}, ensure_ascii=False) + "\n"
 
 
-def model_dump(model: BaseModel) -> dict:
-    if hasattr(model, "model_dump"):
-        return model.model_dump()
-    return model.dict()
+def provider_label(provider: str) -> str:
+    return "DeepSeek" if provider == "deepseek" else "Ollama"
 
 
-def response_content(chunk: Any) -> str:
-    if isinstance(chunk, dict):
-        return chunk.get("message", {}).get("content", "")
-    message = getattr(chunk, "message", None)
-    if isinstance(message, dict):
-        return message.get("content", "")
-    return getattr(message, "content", "") or ""
+def save_spec_version(project_id: str, project: dict[str, Any], spec: dict[str, Any], reason: str) -> str:
+    specs_dir = project_path(project_id) / "specs"
+    specs_dir.mkdir(exist_ok=True)
+    version = len(project.get("artifacts", {}).get("spec_versions", [])) + 1
+    filename = f"spec_{version:03d}_{reason}.json"
+    content = json.dumps(spec, indent=2, ensure_ascii=False)
+    (specs_dir / filename).write_text(content, encoding="utf-8")
+    (specs_dir / "current.json").write_text(content, encoding="utf-8")
+    project["game_spec"] = spec
+    project["current_spec"] = "specs/current.json"
+    project.setdefault("artifacts", {}).setdefault("spec_versions", []).append(
+        {"version": version, "reason": reason, "path": f"specs/{filename}", "created_at": now_iso()}
+    )
+    project["status"]["spec_generated"] = True
+    return f"specs/{filename}"
 
 
-def preview_text(text: str) -> str:
-    if len(text) <= STREAM_PREVIEW_LIMIT:
-        return text
-    return f"...仅显示最后 {STREAM_PREVIEW_LIMIT} 个字符...\n{text[-STREAM_PREVIEW_LIMIT:]}"
+def save_html_version(project_id: str, project: dict[str, Any], html: str) -> str:
+    html_dir = project_path(project_id) / "html"
+    html_dir.mkdir(exist_ok=True)
+    version = len(project.get("artifacts", {}).get("html_versions", [])) + 1
+    filename = f"game_{version:03d}.html"
+    (html_dir / filename).write_text(html, encoding="utf-8")
+    (html_dir / "current.html").write_text(html, encoding="utf-8")
+    project["current_html"] = "html/current.html"
+    project.setdefault("artifacts", {}).setdefault("html_versions", []).append(
+        {"version": version, "path": f"html/{filename}", "created_at": now_iso()}
+    )
+    project["status"]["html_generated"] = True
+    return f"html/{filename}"
 
 
-def stream_chat_content(
-    *,
-    model_name: str,
-    messages: list[dict[str, Any]],
-    options: dict[str, Any],
-    placeholder: Any,
-    language: str,
-    response_format: str | None = None,
-) -> str:
-    content_parts = []
-    shown_chars = 0
-    kwargs: dict[str, Any] = {
-        "model": model_name,
-        "messages": messages,
-        "stream": True,
-        "options": options,
-    }
-    if response_format:
-        kwargs["format"] = response_format
+# --- Routes ---
 
-    for chunk in ollama.chat(**kwargs):
-        content = response_content(chunk)
-        if not content:
+@app.get("/")
+def index() -> FileResponse:
+    return FileResponse(STATIC_DIR / "index.html")
+
+
+@app.get("/api/projects")
+def list_projects() -> JSONResponse:
+    projects = []
+    for manifest in PROJECTS_DIR.glob("*/project.json"):
+        try:
+            p = json.loads(manifest.read_text(encoding="utf-8"))
+            projects.append({
+                "id": p["id"], "name": p["name"],
+                "original_filename": p.get("original_filename"),
+                "created_at": p.get("created_at"), "updated_at": p.get("updated_at"),
+                "status": p.get("status", {}),
+            })
+        except (json.JSONDecodeError, KeyError):
             continue
-        content_parts.append(content)
-
-        full_content = "".join(content_parts)
-        if len(full_content) - shown_chars >= STREAM_UPDATE_CHARS:
-            placeholder.code(preview_text(full_content), language=language)
-            shown_chars = len(full_content)
-
-    full_content = "".join(content_parts)
-    placeholder.code(preview_text(full_content), language=language)
-    return full_content
+    projects.sort(key=lambda x: x.get("updated_at") or "", reverse=True)
+    return JSONResponse({"projects": projects})
 
 
-def build_spec_prompt(game_hint: str, extra_constraints: str, max_frames: int) -> str:
-    return f"""
-Analyze the supplied still frames from a gameplay video and infer a minimal playable browser game.
+@app.post("/api/projects/upload")
+async def upload_project(file: UploadFile = File(...)) -> JSONResponse:
+    suffix = Path(file.filename or "video.mp4").suffix or ".mp4"
+    stem = Path(file.filename or "video").stem[:40].replace(" ", "-") or "video"
+    project_id = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
+    pdir = PROJECTS_DIR / project_id
+    pdir.mkdir(parents=True, exist_ok=True)
+    for d in ("frames", "specs", "html"):
+        (pdir / d).mkdir(exist_ok=True)
+    video_path = pdir / f"source{suffix}"
+    with video_path.open("wb") as out:
+        shutil.copyfileobj(file.file, out)
+    try:
+        metadata = video_metadata(video_path)
+    except ValueError as e:
+        shutil.rmtree(pdir, ignore_errors=True)
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
-Output valid JSON matching exactly this schema:
-{{
-  "title": "string",
-  "genre": "string",
-  "objective": "string",
-  "player_controls": ["string"],
-  "gameplay_loop": ["string"],
-  "entities": [
-    {{
-      "name": "string",
-      "role": "player|enemy|obstacle|projectile|ui|environment",
-      "behavior": "string"
-    }}
-  ],
-  "scoring_rules": ["string"],
-  "win_condition": "string",
-  "lose_condition": "string",
-  "physics": {{
-    "gravity": "string",
-    "jump_or_impulse": "string",
-    "collision_style": "string",
-    "movement_style": "string"
-  }},
-  "visual_style": {{
-    "perspective": "string",
-    "palette": "string",
-    "background": "string",
-    "ui_elements": ["string"]
-  }},
-  "assumptions": ["string"],
-  "confidence_notes": ["string"]
-}}
-
-Constraints:
-- Keep the design implementable in one HTML file.
-- Avoid menus, accounts, networking, cutscenes, assets, and multi-level progression.
-- Prefer a playable small prototype over a complex clone.
-- You are seeing at most {max_frames} frames, so be conservative.
-
-Optional user hint:
-{game_hint or "None"}
-
-Extra constraints:
-{extra_constraints or "None"}
-
-Return JSON only.
-""".strip()
-
-
-def build_code_prompt(game_spec: dict) -> str:
-    spec_json = json.dumps(game_spec, indent=2, ensure_ascii=False)
-    return f"""
-Generate a complete playable browser game from this specification:
-
-{spec_json}
-
-Implementation requirements:
-- One self-contained HTML document.
-- Inline CSS and JavaScript.
-- Canvas-based game rendering.
-- requestAnimationFrame game loop.
-- Simple shapes and colors only.
-- Visible score and instructions.
-- Start and restart controls.
-- Keyboard controls must work inside iframe previews.
-
-Return raw HTML only.
-""".strip()
-
-
-def save_uploaded_video(uploaded_file) -> Path:
-    suffix = Path(uploaded_file.name).suffix or ".mp4"
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(uploaded_file.getbuffer())
-        return Path(tmp.name)
-
-
-def extract_frames(video_path: Path, max_frames: int) -> List[str]:
-    cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        raise ValueError("Cannot open the uploaded video.")
-
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    if total_frames <= 0:
-        total_frames = max_frames
-
-    sample_indexes = {
-        int(i * max(1, total_frames - 1) / max(1, max_frames - 1))
-        for i in range(max_frames)
+    project = {
+        "id": project_id, "name": stem,
+        "created_at": now_iso(), "updated_at": now_iso(),
+        "original_filename": file.filename,
+        "video_path": str(video_path),
+        "video_url": f"/api/projects/{project_id}/video",
+        "metadata": metadata,
+        "status": {"video_uploaded": True, "frames_extracted": False, "spec_generated": False, "html_generated": False},
+        "frames": [], "game_hint": "", "game_spec": None, "current_spec": None, "current_html": None,
+        "artifacts": {"spec_versions": [], "html_versions": []},
     }
-
-    frames = []
-    frame_index = 0
-    while len(frames) < max_frames:
-        ok, frame = cap.read()
-        if not ok:
-            break
-
-        if frame_index in sample_indexes:
-            ok, buffer = cv2.imencode(
-                ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85]
-            )
-            if ok:
-                frames.append(base64.b64encode(buffer).decode("ascii"))
-
-        frame_index += 1
-
-    cap.release()
-
-    if not frames:
-        raise ValueError("No frames could be extracted from the video.")
-    return frames
+    write_project(project_id, project)
+    return JSONResponse(project_for_client(project))
 
 
-def extract_json_object(text: str) -> str:
-    start = text.find("{")
-    end = text.rfind("}")
-    if start < 0 or end <= start:
-        raise ValueError("The model did not return a JSON object.")
-    return text[start : end + 1]
+@app.get("/api/projects/{project_id}")
+def get_project(project_id: str) -> JSONResponse:
+    return JSONResponse(project_for_client(read_project(project_id)))
 
 
-def strip_code_fence(text: str) -> str:
-    html = text.strip()
-    if html.startswith("```"):
-        lines = html.splitlines()
-        if lines and lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].startswith("```"):
-            lines = lines[:-1]
-        html = "\n".join(lines).strip()
-    return html
+@app.get("/api/projects/{project_id}/video")
+def get_video(project_id: str) -> FileResponse:
+    return FileResponse(read_project(project_id)["video_path"])
 
 
-def patch_iframe_keyboard(html: str) -> str:
-    if "<canvas" in html and "tabindex=" not in html:
-        html = html.replace("<canvas", '<canvas tabindex="0"', 1)
-
-    patch = """
-<script>
-(function () {
-  const canvas = document.querySelector("canvas");
-  if (!canvas) return;
-  if (!canvas.hasAttribute("tabindex")) canvas.setAttribute("tabindex", "0");
-
-  function focusGame() {
-    try { canvas.focus(); } catch (error) {}
-  }
-
-  window.addEventListener("load", focusGame);
-  canvas.addEventListener("click", focusGame);
-  document.querySelectorAll("button").forEach((button) => {
-    button.addEventListener("click", () => setTimeout(focusGame, 50));
-  });
-  document.addEventListener("keydown", (event) => {
-    if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", " "].includes(event.key)) {
-      event.preventDefault();
-    }
-  }, { passive: false });
-})();
-</script>
-""".strip()
-
-    if "</body>" in html:
-        return html.replace("</body>", f"{patch}\n</body>")
-    return f"{html}\n{patch}"
-
-
-def infer_game_spec(
-    model_name: str,
-    video_path: Path,
-    game_hint: str,
-    extra_constraints: str,
-    max_frames: int,
-    stream_placeholder: Any | None = None,
-) -> dict:
-    frames = extract_frames(video_path, max_frames)
-    messages = [
-        {"role": "system", "content": SPEC_SYSTEM_PROMPT},
-        {
-            "role": "user",
-            "content": build_spec_prompt(game_hint, extra_constraints, max_frames),
-            "images": frames,
-        },
-    ]
-    if stream_placeholder:
-        raw_content = stream_chat_content(
-            model_name=model_name,
-            messages=messages,
-            options={"temperature": 0.1, "num_ctx": 8192},
-            placeholder=stream_placeholder,
-            language="json",
-            response_format="json",
-        )
-    else:
-        response = ollama.chat(
-            model=model_name,
-            messages=messages,
-            options={"temperature": 0.1, "num_ctx": 8192},
-            format="json",
-        )
-        raw_content = response["message"]["content"]
-
-    parsed = json.loads(extract_json_object(raw_content))
-    return model_dump(GameSpec(**parsed))
-
-
-def generate_game_html(
-    model_name: str, game_spec: dict, stream_placeholder: Any | None = None
-) -> str:
-    messages = [
-        {"role": "system", "content": CODE_SYSTEM_PROMPT},
-        {"role": "user", "content": build_code_prompt(game_spec)},
-    ]
-    if stream_placeholder:
-        raw_content = stream_chat_content(
-            model_name=model_name,
-            messages=messages,
-            options={"temperature": 0.2, "num_ctx": 8192},
-            placeholder=stream_placeholder,
-            language="html",
-        )
-    else:
-        response = ollama.chat(
-            model=model_name,
-            messages=messages,
-            options={"temperature": 0.2, "num_ctx": 8192},
-        )
-        raw_content = response["message"]["content"]
-
-    html = strip_code_fence(raw_content)
-    if "<html" not in html.lower() or "<canvas" not in html.lower():
-        raise ValueError("The model did not return a complete canvas HTML game.")
-    return patch_iframe_keyboard(html)
-
-
-def main() -> None:
-    st.set_page_config(page_title="Video to playable HTML Game", layout="wide")
-    st.title("Video to playable HTML Game")
-    st.caption(
-        "上传一段玩法视频，抽取关键帧，用 Ollama/Qwen 推断游戏规则并生成可玩的单文件 HTML5 游戏。"
+@app.post("/api/projects/{project_id}/extract")
+def extract_project_frames(project_id: str, request: ExtractRequest) -> JSONResponse:
+    project = read_project(project_id)
+    frames = extract_frames(
+        Path(project["video_path"]),
+        project_path(project_id) / "frames",
+        project_id,
+        request.max_frames,
     )
+    project["frames"] = frames
+    project["status"]["frames_extracted"] = True
+    write_project(project_id, project)
+    return JSONResponse({
+        "project": project_for_client(project),
+        "frames": [{k: v for k, v in f.items() if k != "image_base64"} for f in frames],
+        "metadata": project["metadata"],
+    })
 
-    with st.sidebar:
-        st.header("生成设置")
-        model_name = st.text_input("Ollama 模型", value=DEFAULT_MODEL)
-        max_frames = st.slider("抽帧数量", min_value=3, max_value=8, value=5)
-        game_hint = st.text_input("玩法提示", value="Simple Snake-like arcade game")
-        extra_constraints = st.text_area(
-            "额外约束",
-            value="Keep the game simple, responsive, and playable with arrow keys or spacebar.",
-            height=120,
-        )
 
-    uploaded_video = st.file_uploader(
-        "上传游戏视频",
-        type=["mp4", "mov", "avi", "mkv", "webm"],
+@app.get("/api/projects/{project_id}/frames/{filename}")
+def get_frame(project_id: str, filename: str) -> FileResponse:
+    if "/" in filename or ".." in filename:
+        raise HTTPException(status_code=400, detail="Invalid filename.")
+    frame_path = project_path(project_id) / "frames" / filename
+    if not frame_path.exists():
+        raise HTTPException(status_code=404, detail="Frame not found.")
+    return FileResponse(frame_path)
+
+
+# --- Hint ---
+
+@app.post("/api/projects/{project_id}/hint/input")
+def get_hint_input(project_id: str, request: HintRequest) -> JSONResponse:
+    frames = load_frame_images(project_path(project_id) / "frames", request.max_frames)
+    return JSONResponse({
+        "system_prompt": HINT_SYSTEM_PROMPT,
+        "user_prompt": build_hint_prompt(request.max_frames, request.user_notes),
+        "model": request.model,
+        "frame_count": len(frames),
+    })
+
+
+@app.post("/api/projects/{project_id}/hint/stream")
+def generate_gameplay_hint(project_id: str, request: HintRequest) -> StreamingResponse:
+    frames = load_frame_images(project_path(project_id) / "frames", request.max_frames)
+    user_prompt = build_hint_prompt(request.max_frames, request.user_notes)
+    messages = [
+        {"role": "system", "content": HINT_SYSTEM_PROMPT},
+        {"role": "user", "content": user_prompt, "images": frames},
+    ]
+
+    def generate() -> Iterable[str]:
+        yield ndjson_event("meta", {
+            "stage": "hint", "status": "calling_model",
+            "model": request.model, "frame_count": len(frames),
+            "message": f"Calling {request.model} with {len(frames)} frames...",
+        })
+        raw_content = ""
+        try:
+            for event, payload in stream_chat_with_heartbeat(
+                provider="ollama", model=request.model, messages=messages,
+                options={"temperature": 0.1, "num_ctx": SPEC_NUM_CTX},
+                response_format="json", think=False, first_chunk_timeout_seconds=60,
+            ):
+                if event == "heartbeat":
+                    yield ndjson_event("meta", {
+                        "stage": "hint", "status": "waiting_model",
+                        "elapsed_seconds": payload,
+                        "message": f"Waiting for model... {payload}s elapsed.",
+                    })
+                    continue
+                delta, full_content, think_delta = payload
+                raw_content = full_content
+                if delta:
+                    yield ndjson_event("delta", delta)
+
+            hint = parse_gameplay_hint(raw_content)
+            project = read_project(project_id)
+            project["game_hint"] = hint
+            write_project(project_id, project)
+            yield ndjson_event("final", {"project": project_for_client(project), "game_hint": hint})
+        except Exception as error:
+            yield ndjson_event("error", str(error))
+
+    return StreamingResponse(generate(), media_type="application/x-ndjson")
+
+
+# --- Spec ---
+
+@app.post("/api/projects/{project_id}/spec/input")
+def get_spec_input(project_id: str, request: SpecRequest) -> JSONResponse:
+    gameplay_brief = request.game_hint.strip()
+    if not gameplay_brief:
+        raise HTTPException(status_code=400, detail="Generate or enter a gameplay hint first.")
+    return JSONResponse({
+        "system_prompt": SPEC_DRAFT_SYSTEM_PROMPT,
+        "user_prompt": build_spec_prompt(gameplay_brief, request.extra_constraints),
+        "model": request.model,
+    })
+
+
+@app.post("/api/projects/{project_id}/spec/stream")
+def generate_spec(project_id: str, request: SpecRequest) -> StreamingResponse:
+    gameplay_brief = request.game_hint.strip()
+    if not gameplay_brief:
+        raise HTTPException(status_code=400, detail="Generate or enter a gameplay hint first.")
+
+    def generate() -> Iterable[str]:
+        user_prompt = build_spec_prompt(gameplay_brief, request.extra_constraints)
+        yield ndjson_event("meta", {
+            "stage": "spec", "status": "calling_model", "model": request.model,
+            "message": f"Calling {request.model} for compact GameSpec draft...",
+        })
+
+        raw_output = ""
+        spec_source = "llm_draft"
+        try:
+            for event, payload in stream_chat_with_heartbeat(
+                provider="ollama", model=request.model,
+                messages=[
+                    {"role": "system", "content": SPEC_DRAFT_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+                options={"temperature": 0.0, "num_ctx": SPEC_NUM_CTX, "num_predict": 700},
+                response_format="json", think=False, first_chunk_timeout_seconds=30,
+            ):
+                if event == "heartbeat":
+                    yield ndjson_event("meta", {
+                        "stage": "spec", "status": "waiting_model",
+                        "elapsed_seconds": payload,
+                        "message": f"Waiting for spec draft... {payload}s elapsed.",
+                    })
+                    continue
+                delta, full_content, _ = payload
+                raw_output = full_content
+                if delta:
+                    yield ndjson_event("delta", delta)
+
+            if not raw_output.strip():
+                raise ValueError("Model returned empty output.")
+            draft = parse_spec_draft(raw_output)
+            spec = expand_spec_draft(draft, gameplay_brief)
+        except Exception as e:
+            spec_source = "generic_fallback"
+            spec = generic_spec_from_hint(gameplay_brief)
+            yield ndjson_event("meta", {
+                "stage": "spec", "status": "fallback",
+                "message": f"LLM draft failed ({e}). Using generic fallback.",
+            })
+
+        yield ndjson_event("full", json.dumps(spec, indent=2, ensure_ascii=False))
+
+        project = read_project(project_id)
+        project["game_hint"] = gameplay_brief
+        save_spec_version(project_id, project, spec, "initial")
+        write_project(project_id, project)
+        yield ndjson_event("final", {"project": project_for_client(project), "game_spec": spec})
+
+    return StreamingResponse(generate(), media_type="application/x-ndjson")
+
+
+@app.post("/api/projects/{project_id}/spec/chat/stream")
+def edit_spec(project_id: str, request: SpecEditRequest) -> StreamingResponse:
+    draft = game_spec_to_draft(request.current_spec)
+    draft_json = json.dumps(draft.model_dump(), indent=2, ensure_ascii=False)
+    user_prompt = build_spec_edit_prompt(draft_json, request.user_message)
+    messages = [
+        {"role": "system", "content": SPEC_EDIT_SYSTEM_PROMPT},
+        {"role": "user", "content": user_prompt},
+    ]
+
+    def generate() -> Iterable[str]:
+        yield ndjson_event("meta", {
+            "stage": "spec_edit", "status": "calling_model",
+            "message": f"Calling {request.model} to edit GameSpec...",
+        })
+        try:
+            raw_output = ollama_chat_complete(
+                model=request.model, messages=messages,
+                options={"temperature": 0.0, "num_ctx": SPEC_NUM_CTX, "num_predict": 700},
+                response_format="json", think=False,
+            )
+            new_draft = parse_spec_draft(raw_output)
+            project = read_project(project_id)
+            spec = expand_spec_draft(new_draft, project.get("game_hint", ""), baseline_spec=request.current_spec)
+            spec["confidence_notes"] = ensure_string_list(request.current_spec.get("confidence_notes"))
+            spec["confidence_notes"].append("Updated via chat edit")
+
+            yield ndjson_event("delta", json.dumps(spec, indent=2, ensure_ascii=False))
+            save_spec_version(project_id, project, spec, "chat_edit")
+            write_project(project_id, project)
+            yield ndjson_event("final", {"project": project_for_client(project), "game_spec": spec})
+        except Exception as error:
+            yield ndjson_event("error", str(error))
+
+    return StreamingResponse(generate(), media_type="application/x-ndjson")
+
+
+# --- HTML generation ---
+
+@app.post("/api/projects/{project_id}/html/input")
+def get_html_input(project_id: str, request: HtmlRequest) -> JSONResponse:
+    GameSpec(**request.game_spec)
+    return JSONResponse({
+        "provider": request.provider,
+        "model": request.model,
+        "system_prompt": FULL_HTML_SYSTEM_PROMPT,
+        "user_prompt": build_full_html_prompt(request.game_spec),
+    })
+
+
+@app.post("/api/projects/{project_id}/html/stream")
+def generate_html(project_id: str, request: HtmlRequest) -> StreamingResponse:
+    GameSpec(**request.game_spec)
+
+    def generate() -> Iterable[str]:
+        stop_event = threading.Event()
+        user_prompt = build_full_html_prompt(request.game_spec)
+        messages = [
+            {"role": "system", "content": FULL_HTML_SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ]
+        yield ndjson_event("meta", {
+            "stage": "html", "status": "calling_model",
+            "provider": request.provider, "model": request.model,
+            "message": f"Calling {provider_label(request.provider)} {request.model} to generate HTML game...",
+        })
+
+        raw_output = ""
+        try:
+            for event, payload in stream_chat_with_heartbeat(
+                provider=request.provider, model=request.model, messages=messages,
+                options={"temperature": 0.15, "num_ctx": HTML_NUM_CTX, "num_predict": HTML_NUM_PREDICT},
+                think=False, first_chunk_timeout_seconds=60, stop_event=stop_event,
+            ):
+                if event == "heartbeat":
+                    yield ndjson_event("meta", {
+                        "stage": "html", "status": "waiting_model",
+                        "elapsed_seconds": payload,
+                        "message": f"Waiting for HTML tokens... {payload}s elapsed.",
+                    })
+                    continue
+                delta, full_content, think_delta = payload
+                raw_output = full_content
+                if think_delta:
+                    yield ndjson_event("think_delta", think_delta)
+                if delta:
+                    yield ndjson_event("module_delta", {"attempt": 1, "mode": "full_html", "delta": delta})
+
+            if not raw_output.strip():
+                raise ValueError("Model returned empty HTML.")
+
+            html = prepare_full_html_output(raw_output)
+
+            yield ndjson_event("meta", {
+                "stage": "html", "status": "validating",
+                "message": "Validating generated HTML with Playwright...",
+            })
+            validate_html_game_output(html)
+            validation = validate_html_with_playwright(html)
+            yield ndjson_event("validation", {"attempt": 1, "ok": True, "stage": "passed", "message": str(validation)})
+
+            project = read_project(project_id)
+            save_html_version(project_id, project, html)
+            write_project(project_id, project)
+
+            yield ndjson_event("full", html)
+            yield ndjson_event("final", {
+                "project": project_for_client(project),
+                "html": html,
+                "download_url": f"/api/projects/{project_id}/html/download",
+                "preview_url": f"/api/projects/{project_id}/html/preview",
+            })
+        except Exception as error:
+            yield ndjson_event("error", str(error))
+        finally:
+            stop_event.set()
+
+    return StreamingResponse(generate(), media_type="application/x-ndjson")
+
+
+@app.post("/api/projects/{project_id}/html/chat/stream")
+def edit_html(project_id: str, request: HtmlEditRequest) -> StreamingResponse:
+    if not request.current_html.strip():
+        raise HTTPException(status_code=400, detail="Current HTML is empty.")
+    if not request.user_message.strip():
+        raise HTTPException(status_code=400, detail="Fix request is empty.")
+
+    project = read_project(project_id)
+    gameplay_hint = request.gameplay_hint.strip() or project.get("game_hint", "")
+    prepared_html = strip_server_html_patch(request.current_html.strip())
+    user_prompt = build_html_edit_prompt(prepared_html, request.user_message.strip(), gameplay_hint)
+    messages = [
+        {"role": "system", "content": HTML_EDIT_SYSTEM_PROMPT},
+        {"role": "user", "content": user_prompt},
+    ]
+
+    def generate() -> Iterable[str]:
+        stop_event = threading.Event()
+        yield ndjson_event("meta", {
+            "stage": "html_edit", "status": "calling_model",
+            "provider": request.provider, "model": request.model,
+            "message": f"Calling {provider_label(request.provider)} {request.model} to fix HTML...",
+        })
+        raw_content = ""
+        try:
+            for event, payload in stream_chat_with_heartbeat(
+                provider=request.provider, model=request.model, messages=messages,
+                options={"temperature": 0.15, "num_ctx": HTML_NUM_CTX, "num_predict": HTML_NUM_PREDICT},
+                think=False, first_chunk_timeout_seconds=60, stop_event=stop_event,
+            ):
+                if event == "heartbeat":
+                    yield ndjson_event("meta", {
+                        "stage": "html_edit", "status": "waiting_model",
+                        "elapsed_seconds": payload,
+                        "message": f"Waiting for fixed HTML... {payload}s elapsed.",
+                    })
+                    continue
+                delta, full_content, think_delta = payload
+                raw_content = full_content
+                if think_delta:
+                    yield ndjson_event("think_delta", think_delta)
+                if delta:
+                    yield ndjson_event("delta", delta)
+
+            if not raw_content.strip():
+                raise ValueError("Model returned empty HTML.")
+            html = prepare_full_html_output(raw_content)
+            validate_html_game_output(html)
+
+            yield ndjson_event("full", html)
+            project = read_project(project_id)
+            save_html_version(project_id, project, html)
+            write_project(project_id, project)
+            yield ndjson_event("final", {
+                "project": project_for_client(project),
+                "html": html,
+                "download_url": f"/api/projects/{project_id}/html/download",
+                "preview_url": f"/api/projects/{project_id}/html/preview",
+            })
+        except Exception as error:
+            yield ndjson_event("error", str(error))
+        finally:
+            stop_event.set()
+
+    return StreamingResponse(generate(), media_type="application/x-ndjson")
+
+
+@app.get("/api/projects/{project_id}/html/preview")
+def preview_html(project_id: str) -> FileResponse:
+    project = read_project(project_id)
+    if not project.get("current_html"):
+        raise HTTPException(status_code=404, detail="HTML game not generated.")
+    return FileResponse(project_path(project_id) / project["current_html"], media_type="text/html")
+
+
+@app.get("/api/projects/{project_id}/html/download")
+def download_html(project_id: str) -> FileResponse:
+    project = read_project(project_id)
+    if not project.get("current_html"):
+        raise HTTPException(status_code=404, detail="HTML game not generated.")
+    return FileResponse(
+        project_path(project_id) / project["current_html"],
+        filename=f"{project['name']}_game.html",
+        media_type="text/html",
     )
-
-    st.session_state.setdefault("game_spec", None)
-    st.session_state.setdefault("game_html", None)
-
-    if uploaded_video is None:
-        st.info("请先上传一段较短的玩法视频。首次运行前需要执行：ollama run qwen3:8b")
-        return
-
-    video_path = save_uploaded_video(uploaded_video)
-    left, right = st.columns([1, 1])
-
-    with left:
-        st.subheader("原始视频")
-        st.video(str(video_path))
-
-    with right:
-        st.subheader("本地生成流水线")
-        if st.button("生成 HTML 游戏", type="primary"):
-            status_placeholder = st.empty()
-            with st.expander("模型中间输出：游戏规格 JSON", expanded=True):
-                spec_stream_placeholder = st.empty()
-            with st.expander("模型中间输出：HTML 源码", expanded=True):
-                html_stream_placeholder = st.empty()
-
-            try:
-                status_placeholder.info("正在抽帧并推断游戏规格...")
-                spec = infer_game_spec(
-                    model_name=model_name,
-                    video_path=video_path,
-                    game_hint=game_hint,
-                    extra_constraints=extra_constraints,
-                    max_frames=max_frames,
-                    stream_placeholder=spec_stream_placeholder,
-                )
-                st.session_state.game_spec = spec
-
-                status_placeholder.info("正在根据规格生成单文件 HTML 游戏...")
-                html = generate_game_html(
-                    model_name,
-                    st.session_state.game_spec,
-                    stream_placeholder=html_stream_placeholder,
-                )
-                st.session_state.game_html = html
-                html_stream_placeholder.code(preview_text(html), language="html")
-                (OUTPUT_DIR / "game_spec.json").write_text(
-                    json.dumps(
-                        st.session_state.game_spec, indent=2, ensure_ascii=False
-                    ),
-                    encoding="utf-8",
-                )
-                (OUTPUT_DIR / "generated_game.html").write_text(html, encoding="utf-8")
-
-                status_placeholder.success("生成完成。")
-            except ValidationError as error:
-                status_placeholder.error(f"规格校验失败：{error}")
-            except Exception as error:
-                status_placeholder.error(f"生成失败：{error}")
-
-    if st.session_state.game_spec:
-        st.subheader("推断出的游戏规格")
-        st.json(st.session_state.game_spec)
-
-    if st.session_state.game_html:
-        preview_tab, code_tab, download_tab = st.tabs(["预览", "HTML 源码", "下载"])
-        with preview_tab:
-            st.caption("点击游戏区域后使用键盘操作。如果焦点丢失，再点击一次画布即可。")
-            components.html(st.session_state.game_html, height=760, scrolling=False)
-        with code_tab:
-            st.code(st.session_state.game_html, language="html")
-        with download_tab:
-            st.download_button(
-                "下载 HTML 游戏",
-                data=st.session_state.game_html,
-                file_name="generated_game.html",
-                mime="text/html",
-            )
-            st.download_button(
-                "下载游戏规格 JSON",
-                data=json.dumps(
-                    st.session_state.game_spec, indent=2, ensure_ascii=False
-                ),
-                file_name="game_spec.json",
-                mime="application/json",
-            )
-
-
-if __name__ == "__main__":
-    main()

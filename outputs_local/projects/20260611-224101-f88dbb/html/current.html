@@ -1,0 +1,385 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dino Runner</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            background: #1a1a2e;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            overflow: hidden;
+            font-family: monospace;
+        }
+        canvas {
+            border: 3px solid #555;
+            border-radius: 8px;
+            background: #87CEEB;
+            display: block;
+            max-width: 100vw;
+            max-height: 100vh;
+            outline: none;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="c" width="800" height="300" tabindex="0"></canvas>
+    <script>
+        (function() {
+            const canvas = document.getElementById('c');
+            const ctx = canvas.getContext('2d');
+            const W = canvas.width;
+            const H = canvas.height;
+            const GROUND_Y = 250;
+            const GROUND_H = H - GROUND_Y;
+
+            canvas.focus();
+
+            document.addEventListener('click', () => canvas.focus());
+            canvas.addEventListener('click', (e) => {
+                e.stopPropagation();
+                canvas.focus();
+            });
+
+            document.addEventListener('keydown', function(e) {
+                if (e.code === 'Space' || e.code === 'ArrowUp' || e.code === 'ArrowDown' ||
+                    e.code === 'ArrowLeft' || e.code === 'ArrowRight') {
+                    e.preventDefault();
+                }
+            });
+
+            let gameState = 'start';
+            let score = 0;
+            let highScore = 0;
+            let speed = 4;
+            let playerY = GROUND_Y;
+            let playerVy = 0;
+            const playerX = 90;
+            let isOnGround = true;
+            let legFrame = 0;
+            let legTimer = 0;
+            let obstacles = [];
+            let spawnTimer = 0;
+            let nextSpawnDist = 400;
+            let groundScroll = 0;
+            let cloudPositions = [
+                { x: 200, y: 60, w: 80, h: 30 },
+                { x: 500, y: 40, w: 100, h: 35 },
+                { x: 700, y: 75, w: 70, h: 25 }
+            ];
+
+            const GRAVITY = 0.65;
+            const JUMP_VEL = -12.5;
+
+            function resetGame() {
+                score = 0;
+                speed = 4;
+                playerY = GROUND_Y;
+                playerVy = 0;
+                isOnGround = true;
+                legFrame = 0;
+                legTimer = 0;
+                obstacles = [];
+                spawnTimer = 0;
+                nextSpawnDist = 400;
+                groundScroll = 0;
+                gameState = 'playing';
+            }
+
+            function spawnObstacle() {
+                const h = 30 + Math.floor(Math.random() * 35);
+                const x = W + 20 + Math.floor(Math.random() * 80);
+                obstacles.push({
+                    x: x,
+                    height: h,
+                    width: 16,
+                    hasLeftArm: h > 42,
+                    hasRightArm: h > 36,
+                    passed: false
+                });
+            }
+
+            function getPlayerHitbox() {
+                const bw = 28;
+                const bh = 38;
+                const bx = playerX - bw / 2;
+                const by = playerY - bh;
+                return { x: bx + 3, y: by + 3, w: bw - 6, h: bh - 3 };
+            }
+
+            function getObstacleHitbox(obs) {
+                const ox = obs.x - obs.width / 2;
+                const oy = GROUND_Y - obs.height;
+                let ow = obs.width;
+                if (obs.hasLeftArm) ow = Math.max(ow, 24);
+                if (obs.hasRightArm) ow = Math.max(ow, 24);
+                return { x: ox - 2, y: oy, w: ow + 4, h: obs.height };
+            }
+
+            function checkCollision(a, b) {
+                return (
+                    a.x < b.x + b.w &&
+                    a.x + a.w > b.x &&
+                    a.y < b.y + b.h &&
+                    a.y + a.h > b.y
+                );
+            }
+
+            function update() {
+                if (gameState !== 'playing') return;
+
+                speed += 0.002;
+                if (speed > 11) speed = 11;
+
+                if (!isOnGround) {
+                    playerVy += GRAVITY;
+                    playerY += playerVy;
+                    if (playerY >= GROUND_Y) {
+                        playerY = GROUND_Y;
+                        playerVy = 0;
+                        isOnGround = true;
+                    }
+                }
+
+                legTimer++;
+                if (isOnGround && legTimer > 7) {
+                    legTimer = 0;
+                    legFrame = 1 - legFrame;
+                }
+                if (!isOnGround) {
+                    legFrame = 0;
+                }
+
+                groundScroll = (groundScroll + speed) % 30;
+
+                for (let i = obstacles.length - 1; i >= 0; i--) {
+                    obstacles[i].x -= speed;
+                    if (obstacles[i].x < -40) {
+                        obstacles.splice(i, 1);
+                    }
+                }
+
+                spawnTimer += speed;
+                if (spawnTimer >= nextSpawnDist) {
+                    spawnTimer = 0;
+                    nextSpawnDist = 320 + Math.floor(Math.random() * 250);
+                    spawnObstacle();
+                    if (Math.random() < 0.25 && speed > 5) {
+                        const obs = obstacles[obstacles.length - 1];
+                        if (obs) {
+                            const h2 = 25 + Math.floor(Math.random() * 30);
+                            obstacles.push({
+                                x: obs.x + 120 + Math.floor(Math.random() * 80),
+                                height: h2,
+                                width: 16,
+                                hasLeftArm: h2 > 42,
+                                hasRightArm: h2 > 36,
+                                passed: false
+                            });
+                        }
+                    }
+                }
+
+                if (obstacles.length === 0 && spawnTimer < 50) {
+                    spawnTimer = nextSpawnDist - 10;
+                }
+
+                const pHit = getPlayerHitbox();
+                for (let i = 0; i < obstacles.length; i++) {
+                    const oHit = getObstacleHitbox(obstacles[i]);
+                    if (checkCollision(pHit, oHit)) {
+                        gameState = 'over';
+                        if (score > highScore) highScore = score;
+                        return;
+                    }
+                    if (!obstacles[i].passed && obstacles[i].x + obstacles[i].width / 2 < playerX) {
+                        obstacles[i].passed = true;
+                        score += 10;
+                    }
+                }
+
+                score += Math.floor(speed * 0.5);
+            }
+
+            function drawCloud(cx, cy, cw, ch) {
+                ctx.fillStyle = '#fff';
+                ctx.beginPath();
+                ctx.ellipse(cx, cy, cw * 0.5, ch * 0.5, 0, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.beginPath();
+                ctx.ellipse(cx - cw * 0.25, cy + ch * 0.15, cw * 0.35, ch * 0.4, 0, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.beginPath();
+                ctx.ellipse(cx + cw * 0.3, cy + ch * 0.1, cw * 0.4, ch * 0.45, 0, 0, Math.PI * 2);
+                ctx.fill();
+            }
+
+            function drawDino(x, y, lf) {
+                const bx = x - 18;
+                const by = y - 44;
+                ctx.fillStyle = '#3a3a3a';
+                ctx.fillRect(bx + 5, by + 6, 26, 22);
+                ctx.fillRect(bx + 22, by - 2, 14, 12);
+                ctx.fillStyle = '#fff';
+                ctx.fillRect(bx + 28, by + 1, 4, 4);
+                ctx.fillStyle = '#222';
+                ctx.fillRect(bx + 29, by + 2, 2, 2);
+                ctx.fillStyle = '#3a3a3a';
+                ctx.fillRect(bx - 10, by + 10, 16, 7);
+                if (lf === 0) {
+                    ctx.fillRect(bx + 3, by + 28, 6, 16);
+                    ctx.fillRect(bx + 16, by + 28, 6, 16);
+                } else {
+                    ctx.fillRect(bx + 1, by + 26, 6, 14);
+                    ctx.fillRect(bx + 18, by + 30, 6, 14);
+                }
+            }
+
+            function drawCactus(ox, oy, h, hasLA, hasRA) {
+                ctx.fillStyle = '#2d8a4e';
+                const cx = ox;
+                const cy = oy - h;
+                ctx.fillRect(cx - 7, cy, 14, h);
+                ctx.fillStyle = '#23703d';
+                ctx.fillRect(cx - 5, cy, 4, h);
+                if (hasLA) {
+                    ctx.fillStyle = '#2d8a4e';
+                    ctx.fillRect(cx - 15, cy + h * 0.35, 8, 5);
+                    ctx.fillRect(cx - 15, cy + h * 0.15, 5, h * 0.28);
+                    ctx.fillStyle = '#23703d';
+                    ctx.fillRect(cx - 14, cy + h * 0.35, 4, 5);
+                }
+                if (hasRA) {
+                    ctx.fillStyle = '#2d8a4e';
+                    ctx.fillRect(cx + 7, cy + h * 0.45, 8, 5);
+                    ctx.fillRect(cx + 10, cy + h * 0.25, 5, h * 0.25);
+                    ctx.fillStyle = '#23703d';
+                    ctx.fillRect(cx + 8, cy + h * 0.45, 4, 5);
+                }
+                ctx.fillStyle = '#2d8a4e';
+                ctx.fillRect(cx - 2, cy - 3, 4, 6);
+            }
+
+            function drawGround() {
+                ctx.fillStyle = '#c9a87c';
+                ctx.fillRect(0, GROUND_Y, W, GROUND_H);
+                ctx.fillStyle = '#b8956a';
+                ctx.fillRect(0, GROUND_Y, W, 4);
+                ctx.fillStyle = '#a6845a';
+                const gs = groundScroll;
+                for (let i = -30 + gs; i < W + 30; i += 30) {
+                    ctx.fillRect(i, GROUND_Y + 12, 12, 2);
+                }
+                const gs2 = (groundScroll + 15) % 30;
+                for (let i = -30 + gs2; i < W + 30; i += 30) {
+                    ctx.fillRect(i, GROUND_Y + 22, 8, 2);
+                }
+            }
+
+            function draw() {
+                ctx.fillStyle = '#c9e8f7';
+                ctx.fillRect(0, 0, W, GROUND_Y);
+
+                for (let i = 0; i < cloudPositions.length; i++) {
+                    const cp = cloudPositions[i];
+                    cp.x -= speed * 0.3;
+                    if (cp.x < -cp.w) cp.x = W + cp.w + Math.random() * 200;
+                    drawCloud(cp.x, cp.y, cp.w, cp.h);
+                }
+
+                drawGround();
+
+                for (let i = 0; i < obstacles.length; i++) {
+                    const obs = obstacles[i];
+                    drawCactus(obs.x, GROUND_Y, obs.height, obs.hasLeftArm, obs.hasRightArm);
+                }
+
+                drawDino(playerX, playerY, legFrame);
+
+                ctx.fillStyle = '#222';
+                ctx.font = 'bold 18px monospace';
+                ctx.textAlign = 'right';
+                ctx.fillText('SCORE: ' + Math.floor(score), W - 20, 30);
+
+                if (gameState === 'start') {
+                    ctx.fillStyle = 'rgba(0,0,0,0.4)';
+                    ctx.fillRect(0, 0, W, H);
+                    ctx.fillStyle = '#fff';
+                    ctx.font = 'bold 36px monospace';
+                    ctx.textAlign = 'center';
+                    ctx.fillText('DINO RUNNER', W / 2, H / 2 - 30);
+                    ctx.font = '18px monospace';
+                    ctx.fillText('Press SPACE to Start', W / 2, H / 2 + 25);
+                    ctx.textAlign = 'right';
+                }
+
+                if (gameState === 'over') {
+                    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+                    ctx.fillRect(0, 0, W, H);
+                    ctx.fillStyle = '#ff5555';
+                    ctx.font = 'bold 32px monospace';
+                    ctx.textAlign = 'center';
+                    ctx.fillText('GAME OVER', W / 2, H / 2 - 30);
+                    ctx.fillStyle = '#fff';
+                    ctx.font = '18px monospace';
+                    ctx.fillText('Score: ' + Math.floor(score) + '  |  Best: ' + Math.floor(highScore), W / 2, H / 2 +
+                        15);
+                    ctx.fillText('Press SPACE to Restart', W / 2, H / 2 + 50);
+                    ctx.textAlign = 'right';
+                }
+            }
+
+            function gameLoop() {
+                update();
+                draw();
+                requestAnimationFrame(gameLoop);
+            }
+
+            canvas.addEventListener('keydown', function(e) {
+                if (e.code === 'Space') {
+                    e.preventDefault();
+                    if (gameState === 'start') {
+                        resetGame();
+                        canvas.focus();
+                    } else if (gameState === 'over') {
+                        resetGame();
+                        canvas.focus();
+                    } else if (gameState === 'playing' && isOnGround) {
+                        playerVy = JUMP_VEL;
+                        isOnGround = false;
+                    }
+                }
+            });
+
+            if (obstacles.length === 0 && gameState === 'start') {
+                // pre-place nothing
+            }
+
+            requestAnimationFrame(gameLoop);
+        })();
+    </script>
+<!-- qwen-video-to-game:keyboard-patch -->
+<script>
+(function () {
+  const canvas = document.querySelector("canvas");
+  if (!canvas) return;
+  if (!canvas.hasAttribute("tabindex")) canvas.setAttribute("tabindex", "0");
+  function focusGame() { try { canvas.focus(); } catch (e) {} }
+  window.addEventListener("load", focusGame);
+  canvas.addEventListener("click", focusGame);
+  document.querySelectorAll("button").forEach(b => b.addEventListener("click", () => setTimeout(focusGame, 50)));
+  document.addEventListener("keydown", e => {
+    if (["ArrowUp","ArrowDown","ArrowLeft","ArrowRight"," "].includes(e.key)) e.preventDefault();
+  }, { passive: false });
+})();
+</script>
+</body>
+</html>

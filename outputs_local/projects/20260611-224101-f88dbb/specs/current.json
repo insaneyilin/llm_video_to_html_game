@@ -1,0 +1,60 @@
+{
+  "title": "Arcade Game",
+  "genre": "Arcade",
+  "objective": "这是一款经典的2D无尽跑酷游戏。玩家控制一只恐龙，通过按空格键进行跳跃来躲避迎面而来的仙人掌等障碍物。目标是尽可能长时间地生存并获取最高分，撞到任何物体即导致失败。",
+  "player_controls": [
+    "keyboard controls described by the gameplay brief"
+  ],
+  "gameplay_loop": [
+    "start game",
+    "control player",
+    "resolve collisions",
+    "update score",
+    "show game over"
+  ],
+  "entities": [
+    {
+      "name": "player",
+      "role": "player",
+      "behavior": "main keyboard-controlled entity"
+    },
+    {
+      "name": "target",
+      "role": "object",
+      "behavior": "goal or item from the described game"
+    },
+    {
+      "name": "hazard",
+      "role": "obstacle",
+      "behavior": "failure condition or blocking object"
+    }
+  ],
+  "scoring_rules": [
+    "score follows the described game objective"
+  ],
+  "win_condition": "the described success condition is reached",
+  "lose_condition": "the described failure condition is reached",
+  "physics": {
+    "gravity": "as required by the described game",
+    "jump_or_impulse": "as required by the described controls",
+    "collision_style": "simple playable collision matching the described game",
+    "movement_style": "keyboard-driven movement"
+  },
+  "visual_style": {
+    "perspective": "simple canvas view matching the described game",
+    "palette": "simple high-contrast arcade colors",
+    "background": "clean playable canvas background",
+    "ui_elements": [
+      "score",
+      "lives or status",
+      "start",
+      "game over"
+    ]
+  },
+  "assumptions": [
+    "这是一款经典的2D无尽跑酷游戏。玩家控制一只恐龙，通过按空格键进行跳跃来躲避迎面而来的仙人掌等障碍物。目标是尽可能长时间地生存并获取最高分，撞到任何物体即导致失败。"
+  ],
+  "confidence_notes": [
+    "Generic fallback used because the model did not return valid compact JSON"
+  ]
+}
