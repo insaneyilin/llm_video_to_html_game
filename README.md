@@ -26,15 +26,15 @@ https://www.datacamp.com/fr/tutorial/qwen-3-5-small-models-tutorial
 
 **1. Generate gameplay hint & GameSpec**
 
-<video src="demo/01_generate_game_hint_and_spec_1280.mp4" controls width="100%"></video>
+https://github.com/user-attachments/assets/26b87361-fe55-4865-a91f-037b54c2718e
 
 **2. Generate single-file HTML game**
 
-<video src="demo/02_generate_single_html_1280.mp4" controls width="100%"></video>
+https://github.com/user-attachments/assets/2c526d2a-1cb2-4177-8f2d-36a158a3def0
 
 **3. Final playable game**
 
-<video src="demo/03_final_game_1280.mp4" controls width="100%"></video>
+https://github.com/user-attachments/assets/749483a5-adf5-40cc-82a9-914506c874f3
 
 Example videos for testing are in `example_videos/`.
 
