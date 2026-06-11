@@ -7,21 +7,6 @@ The app turns a short gameplay video into a playable single-file HTML5 Canvas ga
 Reference article:
 https://www.datacamp.com/fr/tutorial/qwen-3-5-small-models-tutorial
 
-## Features
-
-- Upload gameplay videos in `mp4`, `mov`, `avi`, `mkv`, or `webm` format.
-- Treat each uploaded video as a persistent Project with versioned artifacts.
-- Extract and inspect representative frames before any LLM call.
-- Show the exact system prompt, user prompt, model options, and image count sent to each LLM call.
-- Stream all model output via NDJSON: gameplay hint → GameSpec draft → full HTML.
-- Split visual understanding from code generation: `gameplay_hint` from images → `SpecDraft` from text → expanded `GameSpec` on the server.
-- Edit the generated GameSpec manually in a JSON editor, or ask the model to revise it through chat.
-- Generate a complete standalone HTML5 Canvas game (single-file, no external dependencies).
-- Support **dual LLM providers**: Ollama (local) for hint/spec, DeepSeek API (or Ollama) for HTML generation.
-- Validate the generated HTML with Playwright: canvas presence, motion after input, console/page errors.
-- Patch iframe keyboard focus automatically — arrow keys and spacebar work in preview.
-- Preview and download the standalone HTML game.
-
 ## Demo
 
 **1. Generate gameplay hint & GameSpec**
@@ -37,6 +22,21 @@ https://github.com/user-attachments/assets/2c526d2a-1cb2-4177-8f2d-36a158a3def0
 https://github.com/user-attachments/assets/749483a5-adf5-40cc-82a9-914506c874f3
 
 Example videos for testing are in `example_videos/`.
+
+## Features
+
+- Upload gameplay videos in `mp4`, `mov`, `avi`, `mkv`, or `webm` format.
+- Treat each uploaded video as a persistent Project with versioned artifacts.
+- Extract and inspect representative frames before any LLM call.
+- Show the exact system prompt, user prompt, model options, and image count sent to each LLM call.
+- Stream all model output via NDJSON: gameplay hint → GameSpec draft → full HTML.
+- Split visual understanding from code generation: `gameplay_hint` from images → `SpecDraft` from text → expanded `GameSpec` on the server.
+- Edit the generated GameSpec manually in a JSON editor, or ask the model to revise it through chat.
+- Generate a complete standalone HTML5 Canvas game (single-file, no external dependencies).
+- Support **dual LLM providers**: Ollama (local) for hint/spec, DeepSeek API (or Ollama) for HTML generation.
+- Validate the generated HTML with Playwright: canvas presence, motion after input, console/page errors.
+- Patch iframe keyboard focus automatically — arrow keys and spacebar work in preview.
+- Preview and download the standalone HTML game.
 
 ## Stack
 
